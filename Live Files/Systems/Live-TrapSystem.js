@@ -181,7 +181,10 @@ const TrapSystem = {
         
         // State for auto-release timers
         autoReleaseTimers: {}, // { trapId: { tokenId: timeoutId } }
-        playerReleaseRequests: {} // { trapId: { tokenId: timestamp } }
+        playerReleaseRequests: {}, // { trapId: { tokenId: timestamp } }
+        
+        // State for position update timeouts (to prevent race conditions)
+        positionUpdateTimeouts: {} // { tokenId: timeoutId }
     },
 
     //----------------------------------------------------------------------
@@ -2125,6 +2128,50 @@ const TrapSystem = {
             return total;
         },
 
+        // Helper function to safely schedule a position update with race condition protection
+        schedulePositionUpdate(token, initialPos, finalPos) {
+            const tokenId = token.id;
+            const expectedInitialPos = { x: initialPos.x, y: initialPos.y };
+            const finalPosition = { x: finalPos.x, y: finalPos.y };
+            
+            // Only set final position if it's different from initial
+            if (Math.abs(finalPosition.x - expectedInitialPos.x) > 1 || Math.abs(finalPosition.y - expectedInitialPos.y) > 1) {
+                const timeoutId = setTimeout(() => {
+                    // Validate token still exists and is in expected state
+                    const currentToken = getObj("graphic", tokenId);
+                    if (!currentToken) {
+                        TrapSystem.utils.log(`Token ${tokenId} no longer exists, skipping final position update`, 'warning');
+                        return;
+                    }
+                    
+                    // Check if token is still at the initial position (within tolerance)
+                    const currentPos = { x: currentToken.get("left"), y: currentToken.get("top") };
+                    const positionTolerance = 5; // pixels
+                    const isAtExpectedPosition = 
+                        Math.abs(currentPos.x - expectedInitialPos.x) <= positionTolerance &&
+                        Math.abs(currentPos.y - expectedInitialPos.y) <= positionTolerance;
+                    
+                    if (isAtExpectedPosition) {
+                        currentToken.set({ left: finalPosition.x, top: finalPosition.y });
+                        TrapSystem.utils.log(`Applied final position to token ${tokenId}: (${finalPosition.x}, ${finalPosition.y})`, 'debug');
+                    } else {
+                        TrapSystem.utils.log(`Token ${tokenId} moved from expected position, skipping final position update. Expected: (${expectedInitialPos.x}, ${expectedInitialPos.y}), Current: (${currentPos.x}, ${currentPos.y})`, 'debug');
+                    }
+                    
+                    // Clean up the timeout reference
+                    if (TrapSystem.state.positionUpdateTimeouts && TrapSystem.state.positionUpdateTimeouts[tokenId]) {
+                        delete TrapSystem.state.positionUpdateTimeouts[tokenId];
+                    }
+                }, 500);
+                
+                // Store timeout ID for potential cleanup
+                if (!TrapSystem.state.positionUpdateTimeouts) {
+                    TrapSystem.state.positionUpdateTimeouts = {};
+                }
+                TrapSystem.state.positionUpdateTimeouts[tokenId] = timeoutId;
+            }
+        },
+
         hasLineOfSight(observerToken, targetToken) {
             TrapSystem.utils.log('hasLineOfSight function started.', 'info'); // Unconditional log to confirm execution
             const DEBUG = TrapSystem.config.DEBUG;
@@ -2318,6 +2365,12 @@ const TrapSystem = {
 
     //----------------------------------------------------------------------
     // 3) DETECTION: movement-based triggers
+    // 
+    // RACE CONDITION FIX: The setTimeout calls in trap detection now include:
+    // - Token existence validation before applying final position
+    // - Position validation to ensure token hasn't moved manually
+    // - Timeout ID tracking for cleanup when tokens are destroyed/moved
+    // - Automatic cleanup in destroy:graphic event handler
     //----------------------------------------------------------------------
     detector: {
         async checkTrapTrigger(movedToken, prevX, prevY) { // Made async
@@ -2385,9 +2438,10 @@ const TrapSystem = {
                         const pos = TrapSystem.utils.calculateTrapPosition(movedToken, trapToken, i);
                         TrapSystem.utils.log(`[DEBUG] pos.initial: ${JSON.stringify(pos.initial)}, pos.final: ${JSON.stringify(pos.final)} for trap ${trapToken.id}`, 'debug'); // Log pos.initial and pos.final
                         movedToken.set({ left:pos.initial.x, top:pos.initial.y });
-                        setTimeout(() => {
-                            movedToken.set({ left:pos.final.x, top:pos.final.y });
-                        }, 500);
+                        
+                        // Schedule final position update with race condition protection
+                        TrapSystem.utils.schedulePositionUpdate(movedToken, pos.initial, pos.final);
+                        
                         TrapSystem.triggers.handleTrapTrigger(movedToken, trapToken, i); // Pass intersection point 'i'
                         return; // Important: Return after handling a trigger to prevent multiple triggers from one move
                     }
@@ -2402,9 +2456,10 @@ const TrapSystem = {
                     );
                     TrapSystem.utils.log(`[DEBUG] pos.initial: ${JSON.stringify(pos.initial)}, pos.final: ${JSON.stringify(pos.final)} for trap ${trapToken.id} (overlap case)`, 'debug'); // Log pos.initial and pos.final for overlap
                     movedToken.set({ left:pos.initial.x, top:pos.initial.y });
-                    setTimeout(() => {
-                        movedToken.set({ left:pos.final.x, top:pos.final.y });
-                    }, 500);
+                    
+                    // Schedule final position update with race condition protection
+                    TrapSystem.utils.schedulePositionUpdate(movedToken, pos.initial, pos.final);
+                    
                     TrapSystem.triggers.handleTrapTrigger(movedToken, trapToken, centerOfMovedToken); // Pass centerOfMovedToken as intersection point
                     return; // Important: Return after handling a trigger
                 }
@@ -6244,6 +6299,16 @@ on("change:graphic", async (obj, prev) => {
             obj.set({ left: prev.left, top: prev.top });
             return; // Stop further processing for this locked token's movement event.
         }
+        
+        // --- 1.5. Position Update Timeout Cleanup ---
+        // If a token was moved manually, cancel any pending position updates to prevent conflicts
+        if (obj.get("left") !== prev.left || obj.get("top") !== prev.top) {
+            if (TrapSystem.state.positionUpdateTimeouts && TrapSystem.state.positionUpdateTimeouts[obj.id]) {
+                clearTimeout(TrapSystem.state.positionUpdateTimeouts[obj.id]);
+                delete TrapSystem.state.positionUpdateTimeouts[obj.id];
+                TrapSystem.utils.log(`Cancelled pending position update for manually moved token ${obj.id}`, 'debug');
+            }
+        }
 
         // --- 2. Movement Trigger Logic --- Approved!
         // For any token that is not a trap itself, check if its movement triggers a trap.
@@ -7302,6 +7367,51 @@ on("destroy:handout", (obj) => {
     if (obj.id === TrapSystem.state.settingsHandoutId) {
         TrapSystem.utils.log('Settings handout was destroyed, clearing stored ID', 'warn');
         TrapSystem.state.settingsHandoutId = null;
+    }
+});
+
+// Event listener for when tokens are destroyed - cleanup orphaned timers and state
+on("destroy:graphic", (obj) => {
+    try {
+        const tokenId = obj.id;
+        
+        // Clean up position update timeouts
+        if (TrapSystem.state.positionUpdateTimeouts && TrapSystem.state.positionUpdateTimeouts[tokenId]) {
+            clearTimeout(TrapSystem.state.positionUpdateTimeouts[tokenId]);
+            delete TrapSystem.state.positionUpdateTimeouts[tokenId];
+            TrapSystem.utils.log(`Cleaned up position update timeout for destroyed token ${tokenId}`, 'debug');
+        }
+        
+        // Clean up locked token state
+        if (TrapSystem.state.lockedTokens && TrapSystem.state.lockedTokens[tokenId]) {
+            delete TrapSystem.state.lockedTokens[tokenId];
+            TrapSystem.utils.log(`Cleaned up locked token state for destroyed token ${tokenId}`, 'debug');
+        }
+        
+        // Clean up auto-release timers where this token was the trapped token
+        if (TrapSystem.state.autoReleaseTimers) {
+            Object.keys(TrapSystem.state.autoReleaseTimers).forEach(trapId => {
+                if (TrapSystem.state.autoReleaseTimers[trapId] && TrapSystem.state.autoReleaseTimers[trapId][tokenId]) {
+                    clearTimeout(TrapSystem.state.autoReleaseTimers[trapId][tokenId]);
+                    delete TrapSystem.state.autoReleaseTimers[trapId][tokenId];
+                    TrapSystem.utils.log(`Cleaned up auto-release timer for destroyed token ${tokenId} on trap ${trapId}`, 'debug');
+                    
+                    // If no more tokens for this trap, clean up the trap entry
+                    if (Object.keys(TrapSystem.state.autoReleaseTimers[trapId]).length === 0) {
+                        delete TrapSystem.state.autoReleaseTimers[trapId];
+                    }
+                }
+            });
+        }
+        
+        // Clean up safe move tokens
+        if (TrapSystem.state.safeMoveTokens && TrapSystem.state.safeMoveTokens.has(tokenId)) {
+            TrapSystem.state.safeMoveTokens.delete(tokenId);
+            TrapSystem.utils.log(`Cleaned up safe move state for destroyed token ${tokenId}`, 'debug');
+        }
+        
+    } catch (err) {
+        TrapSystem.utils.log(`Error cleaning up state for destroyed token ${obj.id}: ${err.message}`, 'error');
     }
 });
 
