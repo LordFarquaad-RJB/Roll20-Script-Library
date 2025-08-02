@@ -5067,8 +5067,27 @@ const TrapSystem = {
                 TrapSystem.passive.apiWarningSent = false;
             }
 
-            // 1. Try Beacon API (getSheetItem) first
-            if (typeof getSheetItem === 'function') {
+            // 1. Try Token Bar Fallback FIRST (if enabled and configured - this is deliberate user setup)
+            if (trapConfig && trapConfig.ppTokenBarFallback && trapConfig.ppTokenBarFallback !== "none") {
+                const barKey = trapConfig.ppTokenBarFallback.endsWith('_value') 
+                    ? trapConfig.ppTokenBarFallback 
+                    : `${trapConfig.ppTokenBarFallback}_value`;
+                const barValue = token.get(barKey);
+                if (barValue !== undefined && barValue !== null && barValue !== "") {
+                    const parsedBarPP = parseInt(barValue, 10);
+                    if (!isNaN(parsedBarPP)) {
+                        TrapSystem.utils.log(`Got PP ${parsedBarPP} from token bar '${barKey}' for char ${charId} (configured priority).`, 'debug');
+                        basePP = parsedBarPP;
+                    } else {
+                        TrapSystem.utils.log(`Value from token bar '${barKey}' for char ${charId} is not a number: '${barValue}'`, 'warn');
+                    }
+                } else {
+                     TrapSystem.utils.log(`Token bar '${barKey}' not found or empty for char ${charId} (configured priority).`, 'debug');
+                }
+            }
+
+            // 2. Try Beacon API (getSheetItem) if token bar not configured or failed
+            if (basePP === null && typeof getSheetItem === 'function') {
                 try {
                     const item = await getSheetItem(charId, "passive_wisdom");
                     const ppRaw = (item && typeof item.value !== 'undefined') ? item.value : item;
@@ -5085,12 +5104,12 @@ const TrapSystem = {
                 } catch (err) {
                     TrapSystem.utils.log(`Error with getSheetItem for 'passive_wisdom' on char ${charId}: ${err}. Falling back.`, 'warn');
                 }
-            } else {
+            } else if (basePP === null) {
                 // getSheetItem function doesn't exist - likely not using experimental API
                 TrapSystem.utils.log(`getSheetItem function not available, will try fallback methods`, 'debug');
             }
 
-            // 2. Try to get 'passive_wisdom' attribute directly using getAttrByName (classic method)
+            // 3. Try to get 'passive_wisdom' attribute directly using getAttrByName (classic method) as final fallback
             if (basePP === null && typeof getAttrByName === 'function') {
                 const passiveWisdomRaw = getAttrByName(charId, "passive_wisdom");
                 if (passiveWisdomRaw !== undefined && passiveWisdomRaw !== null && passiveWisdomRaw !== "") {
@@ -5103,25 +5122,6 @@ const TrapSystem = {
                     }
                 } else {
                     TrapSystem.utils.log(`'passive_wisdom' (getAttrByName) not found or empty for char ${charId}.`, 'debug');
-                }
-            }
-            
-            // 3. Try Token Bar Fallback (if other methods failed or were missing)
-            if (basePP === null && trapConfig && trapConfig.ppTokenBarFallback && trapConfig.ppTokenBarFallback !== "none") {
-                const barKey = trapConfig.ppTokenBarFallback.endsWith('_value') 
-                    ? trapConfig.ppTokenBarFallback 
-                    : `${trapConfig.ppTokenBarFallback}_value`;
-                const barValue = token.get(barKey);
-                if (barValue !== undefined && barValue !== null && barValue !== "") {
-                    const parsedBarPP = parseInt(barValue, 10);
-                    if (!isNaN(parsedBarPP)) {
-                        TrapSystem.utils.log(`Got PP ${parsedBarPP} from token bar '${barKey}' for char ${charId} (fallback).`, 'debug');
-                        basePP = parsedBarPP;
-                    } else {
-                        TrapSystem.utils.log(`Value from token bar '${barKey}' for char ${charId} is not a number: '${barValue}'`, 'warn');
-                    }
-                } else {
-                     TrapSystem.utils.log(`Token bar '${barKey}' not found or empty for char ${charId} (fallback).`, 'debug');
                 }
             }
 
