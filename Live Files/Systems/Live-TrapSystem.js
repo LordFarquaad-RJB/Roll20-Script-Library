@@ -140,6 +140,12 @@ const TrapSystem = {
             // bystander: "A token affected by splash/area effects",
             // victim2: "A second trapped token, if multi-trap is supported",
         },
+        // Damage/Healing System Configuration
+        DAMAGE_HEALING: {
+            saveTimeout: 60000,  // 30 seconds for damage/healing saves
+            maxHP: 999,
+            minHP: 0
+        },
     },
 
     state: {
@@ -154,6 +160,7 @@ const TrapSystem = {
         activeInteractions: {},     // Not used heavily, but included
         pendingChecks: {},          // For advantage/disadv checks
         pendingChecksByChar: {},    // New: Lookup by character ID
+        pendingSaves: new Map(),    // For damage/healing save rolls
         displayDCForCheck: {},      // key: playerid, value: true/false
 
         // [NEW] From MacroExport
@@ -202,9 +209,22 @@ const TrapSystem = {
         },
 
         playerIsGM: function(playerId) {
-            const player = getObj("player", playerId);
+            try {
+                // Prefer Roll20's built-in helper if available
+                if (typeof globalThis !== 'undefined' && typeof globalThis.playerIsGM === 'function') {
+                    return globalThis.playerIsGM(playerId);
+                }
+                if (typeof playerIsGM === 'function') {
+                    return playerIsGM(playerId);
+                }
+            } catch (e) { /* ignore and fall back */ }
+
+            // Fallback heuristic using player object flags
+            const player = getObj('player', playerId);
             if (!player) return false;
-            return player.get("_online") && player.get("_type") === "player" && player.get("_isGM");
+            const isGmFlag = !!player.get('_isGM');
+            const nameFlag = (player.get('displayname') || '').toLowerCase().includes('(gm)');
+            return isGmFlag || nameFlag;
         },
 
         // GM whisper
@@ -430,7 +450,7 @@ const TrapSystem = {
         },
 
         // Execute a macro by name
-        executeMacro(commandString, tagToIdMap = {}) {
+        async executeMacro(commandString, tagToIdMap = {}) {
             try {
                 let macroText;
                 commandString = (commandString || '').trim();
@@ -475,9 +495,65 @@ const TrapSystem = {
                 // Process placeholders on the initial part of the macro
                 const processedText = this.replaceMacroPlaceholdersWithTags(macroText, tagToIdMap);
         
+                // NEW: Check for damage/healing patterns in the macro content
+                const trappedCharacterId = tagToIdMap.trapped ? getObj('graphic', tagToIdMap.trapped)?.get('represents') : null;
+                let finalProcessedText = processedText;
+                let hasDamageHealingPatterns = false;
+                
+                if (trappedCharacterId) {
+                    this.log(`Checking macro content for damage/healing patterns: ${processedText.substring(0, 100)}...`, 'debug');
+                    const parsedResults = this.parseDamageOrHealing(processedText);
+                    hasDamageHealingPatterns = parsedResults && (Array.isArray(parsedResults) ? parsedResults.length > 0 : true);
+                    
+                    if (hasDamageHealingPatterns) {
+                        this.log(`Damage/healing patterns detected in macro`, 'debug');
+                        
+                        // Set up a pending save immediately (will be updated with actual roll results later)
+                        const saveReq = parsedResults.find(r => r.type === 'save_requirement') || 
+                                      parsedResults.find(r => r.type === 'save_result_levels');
+                        
+                        if (saveReq) {
+                            // Set up the save system with placeholder damage (will be updated when template is captured)
+                            const saveId = await TrapSystem.utils.setupDamageHealingSave(
+                                trappedCharacterId, 
+                                0, // Placeholder damage - will be updated when template is captured
+                                saveReq.saveType || 'Dexterity', 
+                                saveReq.dc || 14, 
+                                saveReq.saveLevels || null
+                            );
+                            
+                            this.log(`Setup damage/healing save for ${trappedCharacterId}: ${saveReq.saveType || 'Dexterity'} DC ${saveReq.dc || 14}`, 'debug');
+                        }
+                        
+                        // Check if there's a pending save for this character
+                        const pendingSave = Array.from(TrapSystem.state.pendingSaves.values()).find(save => save.characterId === trappedCharacterId);
+                        if (pendingSave) {
+                            this.log(`Found pending save for ${pendingSave.characterName}: ${pendingSave.saveType} DC ${pendingSave.dc}`, 'debug');
+                            
+                            // If this is a template message, integrate the save prompt
+                            if (processedText.trim().startsWith('&{template:desc}')) {
+                                // Extract the existing description
+                                const descMatch = processedText.match(/{{desc=([^}]*)}}/);
+                                if (descMatch) {
+                                    const existingDesc = descMatch[1];
+                                    const savePrompt = `\n\n🛡️ **SAVE REQUIRED:** ${pendingSave.characterName} must make a **${pendingSave.saveType} saving throw (DC ${pendingSave.dc})** | ⏰ **60 seconds to roll or auto-fail**`;
+                                    
+                                    // Replace the description with the enhanced version
+                                    finalProcessedText = processedText.replace(
+                                        /{{desc=([^}]*)}}/,
+                                        `{{desc=${existingDesc}${savePrompt}}}`
+                                    );
+                                    
+                                    this.log(`Enhanced template with save prompt`, 'debug');
+                                }
+                            }
+                        }
+                    }
+                }
+        
                 // Execute the initial part of the macro
-                if (processedText.trim().startsWith('&{')) {
-                    sendChat('', processedText);
+                if (finalProcessedText.trim().startsWith('&{')) {
+                    sendChat('', finalProcessedText);
                 } else {
                     // NOTE: We only split by newlines, not semicolons, to preserve Roll20 template syntax
                     // Semicolons are valid within Roll20 templates and API commands
@@ -2093,36 +2169,902 @@ const TrapSystem = {
             return displayName;
         },
 
-        // Helper to parse and roll a luck die
+        // Update character HP (damage or healing)
+        async updateCharacterHP(characterId, amount, operation = "subtract") {
+            const char = getObj('character', characterId);
+            if (!char) {
+                TrapSystem.utils.log(`Character not found for ID: ${characterId} when trying to update HP`, 'error');
+                return false;
+            }
+
+            const charName = char.get('name');
+            TrapSystem.utils.log(`💖 Updating HP for ${charName} (ID: ${characterId}): ${operation} ${amount}`, 'debug');
+
+            try {
+                // Try to get current HP using getSheetItem
+                let currentHP = 0;
+                let maxHP = 0;
+
+                if (typeof getSheetItem === 'function') {
+                    // Use new async API
+                    try {
+                        TrapSystem.utils.log(` -> Attempting to get HP using getSheetItem for ${charName}`, 'debug');
+                        const hpValue = await getSheetItem(characterId, 'hp');
+                        const maxHpValue = await getSheetItem(characterId, 'hp_max');
+                        
+                        TrapSystem.utils.log(` -> Raw getSheetItem values for ${charName}: hp='${hpValue}', hp_max='${maxHpValue}'`, 'debug');
+                        
+                        currentHP = parseInt(hpValue) || 0;
+                        maxHP = parseInt(maxHpValue) || 0;
+                        
+                        TrapSystem.utils.log(` -> Got HP ${currentHP}/${maxHP} from getSheetItem for ${charName}`, 'debug');
+                    } catch (e) {
+                        TrapSystem.utils.log(` -> Error with getSheetItem for HP on ${charName}: ${e.message}. Falling back.`, 'warn');
+                    }
+                }
+
+                // Fallback to direct character attributes
+                if (currentHP === 0 && maxHP === 0) {
+                    TrapSystem.utils.log(` -> Falling back to direct attributes for ${charName}`, 'debug');
+                    const hpAttr = findObjs({ _type: 'attribute', _characterid: characterId, name: 'hp' })[0];
+                    const maxHpAttr = findObjs({ _type: 'attribute', _characterid: characterId, name: 'hp_max' })[0];
+                    
+                    TrapSystem.utils.log(` -> Found HP attributes for ${charName}: hpAttr=${hpAttr ? 'found' : 'not found'}, maxHpAttr=${maxHpAttr ? 'found' : 'not found'}`, 'debug');
+                    
+                    if (hpAttr) {
+                        const rawHpValue = hpAttr.get('current');
+                        currentHP = parseInt(rawHpValue) || 0;
+                        TrapSystem.utils.log(` -> Raw HP attribute value for ${charName}: '${rawHpValue}' -> parsed as ${currentHP}`, 'debug');
+                    }
+                    if (maxHpAttr) {
+                        const rawMaxHpValue = maxHpAttr.get('current');
+                        maxHP = parseInt(rawMaxHpValue) || 0;
+                        TrapSystem.utils.log(` -> Raw Max HP attribute value for ${charName}: '${rawMaxHpValue}' -> parsed as ${maxHP}`, 'debug');
+                    }
+                    
+                    TrapSystem.utils.log(` -> Got HP ${currentHP}/${maxHP} from direct attributes for ${charName}`, 'debug');
+                }
+
+                // Calculate new HP
+                let newHP = currentHP;
+                if (operation === "subtract") {
+                    newHP = Math.max(0, currentHP - amount);
+                } else if (operation === "add") {
+                    newHP = Math.min(maxHP, currentHP + amount);
+                } else if (operation === "set") {
+                    newHP = Math.max(0, Math.min(maxHP, amount));
+                }
+
+                // Update HP using setSheetItem if available
+                if (typeof setSheetItem === 'function') {
+                    try {
+                        await setSheetItem(characterId, 'hp', newHP);
+                        TrapSystem.utils.log(` -> Updated HP to ${newHP} using setSheetItem for ${charName}`, 'debug');
+                        return true;
+                    } catch (e) {
+                        TrapSystem.utils.log(` -> Error with setSheetItem for HP on ${charName}: ${e.message}. Falling back.`, 'warn');
+                    }
+                }
+
+                // Fallback to direct attribute update
+                const hpAttr = findObjs({ _type: 'attribute', _characterid: characterId, name: 'hp' })[0];
+                if (hpAttr) {
+                    hpAttr.set('current', newHP.toString());
+                    TrapSystem.utils.log(` -> Updated HP to ${newHP} using direct attribute for ${charName}`, 'debug');
+                    return true;
+                }
+
+                TrapSystem.utils.log(` -> Could not find HP attribute to update for ${charName}`, 'error');
+                return false;
+
+            } catch (e) {
+                TrapSystem.utils.log(` -> Error updating HP for ${charName}: ${e.message}`, 'error');
+                return false;
+            }
+        },
+
+        // Apply damage to character
+        async applyDamage(characterId, damageAmount) {
+            const char = getObj('character', characterId);
+            if (!char) {
+                TrapSystem.utils.log(`Character not found for ID: ${characterId} when trying to apply damage`, 'error');
+                return false;
+            }
+
+            const charName = char.get('name');
+            TrapSystem.utils.log(`💥 Applying damage to ${charName} (ID: ${characterId}): ${damageAmount}`, 'debug');
+
+            // Parse damage amount (could be dice formula or flat number)
+            let finalDamage = damageAmount;
+            if (typeof damageAmount === 'string' && damageAmount.includes('d')) {
+                // Dice formula - roll it using our enhanced dice function
+                finalDamage = this.parseAndRollLuckDie(damageAmount);
+                TrapSystem.utils.log(` -> Rolled damage: ${damageAmount} = ${finalDamage}`, 'debug');
+            } else if (typeof damageAmount === 'string') {
+                // Simple number string
+                finalDamage = parseInt(damageAmount) || 0;
+            }
+
+            // Apply the damage using our HP update function
+            const result = await this.updateCharacterHP(characterId, finalDamage, "subtract");
+            if (result) {
+                TrapSystem.utils.chat(`💥 Applied ${finalDamage} damage to ${charName}`);
+            }
+            return result;
+        },
+
+        // Apply healing to character
+        async applyHealing(characterId, healingAmount) {
+            const char = getObj('character', characterId);
+            if (!char) {
+                TrapSystem.utils.log(`Character not found for ID: ${characterId} when trying to apply healing`, 'error');
+                return false;
+            }
+
+            const charName = char.get('name');
+            TrapSystem.utils.log(`💚 Applying healing to ${charName} (ID: ${characterId}): ${healingAmount}`, 'debug');
+
+            // Parse healing amount (could be dice formula or flat number)
+            let finalHealing = healingAmount;
+            if (typeof healingAmount === 'string' && healingAmount.includes('d')) {
+                // Dice formula - roll it using our enhanced dice function
+                finalHealing = this.parseAndRollLuckDie(healingAmount);
+                TrapSystem.utils.log(` -> Rolled healing: ${healingAmount} = ${finalHealing}`, 'debug');
+            } else if (typeof healingAmount === 'string') {
+                // Simple number string
+                finalHealing = parseInt(healingAmount) || 0;
+            }
+
+            // Apply the healing using our HP update function
+            const result = await this.updateCharacterHP(characterId, finalHealing, "add");
+            if (result) {
+                TrapSystem.utils.chat(`💚 Applied ${finalHealing} healing to ${charName}`);
+            }
+            return result;
+        },
+
+        // Helper to parse and roll dice with modifiers
         parseAndRollLuckDie(dieString) {
             if (!dieString) {
                 TrapSystem.utils.log(`Called parseAndRollLuckDie with no dieString. Defaulting to 0.`, 'debug');
                 return 0;
             }
             
-            // Parse the die string (e.g., "1d6", "1d4", etc.)
-            const match = dieString.match(/^(\d+)d(\d+)$/i);
+            // Parse the die string with modifiers (e.g., "1d6", "2d8+3", "1d4-2", etc.)
+            const match = dieString.match(/^(\d+)d(\d+)(?:\+(\d+)|-(\d+))?$/i);
             if (!match) {
-                TrapSystem.utils.log(`Invalid luck die format: ${dieString}. Expected format like '1d6'.`, 'warn');
+                TrapSystem.utils.log(`Invalid dice format: ${dieString}. Expected format like '1d6', '2d8+3', or '1d4-2'.`, 'warn');
                 return 0;
             }
 
             const numDice = parseInt(match[1], 10);
             const sides = parseInt(match[2], 10);
+            const positiveModifier = match[3] ? parseInt(match[3], 10) : 0;
+            const negativeModifier = match[4] ? parseInt(match[4], 10) : 0;
             
             if (isNaN(numDice) || isNaN(sides) || numDice < 1 || sides < 1) {
-                TrapSystem.utils.log(`Invalid luck die values: ${dieString}.`, 'warn');
+                TrapSystem.utils.log(`Invalid dice values: ${dieString}.`, 'warn');
                 return 0;
             }
 
-            // Roll the die
+            // Roll the dice
             let total = 0;
             for (let i = 0; i < numDice; i++) {
                 total += randomInteger(sides);
             }
             
-            TrapSystem.utils.log(`Rolled luck die ${dieString}: ${total}`, 'debug');
+            // Apply modifiers
+            total += positiveModifier - negativeModifier;
+            
+            // Build modifier string for logging
+            let modifierStr = '';
+            if (positiveModifier > 0) modifierStr += `+${positiveModifier}`;
+            if (negativeModifier > 0) modifierStr += `-${negativeModifier}`;
+            
+            TrapSystem.utils.log(`Rolled dice ${dieString}: ${total}${modifierStr ? ` (with modifiers: ${modifierStr})` : ''}`, 'debug');
             return total;
+        },
+
+        // Parse macro content for damage/healing patterns
+        // 
+        // ===== MACRO PATTERN DOCUMENTATION =====
+        // 
+        // DAMAGE PATTERNS:
+        // - 💥 [[2d6]] = Direct damage (no save needed)
+        // - 💥 [[1d8+3]] = Direct damage with modifiers
+        // - 💥 [[1d6]] **Fire** = Damage with type (requires **bold** formatting)
+        // 
+        // HEALING PATTERNS:
+        // - 💚 [[1d8]] = Direct healing (no save needed)
+        // - 💚 [[2d6+3]] = Direct healing with modifiers
+        // 
+        // SAVE REQUIREMENTS:
+        // - 🛡️ Constitution DC 14 = Save requirement only (no damage specified)
+        // - 🛡️ Dexterity saving throw (DC 12) = Alternative format
+        // 
+        // COMBINED PATTERNS (multiple in one macro):
+        // - 💥 [[2d6]] 🛡️ Constitution DC 14 = Damage + Save requirement
+        // - 💥 [[1d6]] **Fire** 🛡️ Dexterity DC 12 = Damage with type + Save
+        // 
+        // SAVE RESULT LEVELS (for complex save systems):
+        // - 🛡️ DC 10 or lower (Half damage) = 50% damage multiplier
+        // - 🛡️ DC 15-20 (Full damage) = 100% damage multiplier  
+        // - 🛡️ DC 21+ (No damage) = 0% damage multiplier
+        // - 🛡️ DC 5 or lower (Critical Fail) = Custom description
+        // - 🛡️ DC 10-15 (Partial success) = Custom description
+        // 
+        // SUPPORTED DAMAGE MULTIPLIERS:
+        // - "Half damage" = 0.5x multiplier
+        // - "Full damage" = 1.0x multiplier
+        // - "No damage" = 0.0x multiplier
+        // - "Quarter damage" = 0.25x multiplier
+        // - "Double damage" = 2.0x multiplier
+        // - "Three-quarters damage" = 0.75x multiplier
+        // 
+        // VALID SAVE TYPES (from SKILL_TYPES config):
+        // - Strength, Dexterity, Constitution, Intelligence, Wisdom, Charisma
+        // - System validates against existing SKILL_TYPES configuration
+        // 
+        // DICE FORMATS SUPPORTED:
+        // - [[1d6]], [[2d8+3]], [[1d4-2]], [[1d20+5]]
+        // - Modifiers: +3, -2, +5, etc.
+        // - Uses enhanced parseAndRollLuckDie() function
+        // 
+        // PLACEHOLDER SUPPORT:
+        // - <&trapped> = Currently trapped token
+        // - <&trap> = The trap token itself
+        // - Works with existing placeholder system
+        // 
+        // ======================================
+        parseDamageOrHealing(macroText) {
+            if (!macroText || typeof macroText !== 'string') {
+                TrapSystem.utils.log('parseDamageOrHealing called with invalid macro text', 'warn');
+                return null;
+            }
+
+            TrapSystem.utils.log(`Parsing macro for damage/healing patterns: ${macroText.substring(0, 100)}...`, 'debug');
+
+            const results = [];
+
+            // Pattern 1: Direct damage/healing commands
+            const directPatterns = [
+                { type: 'damage', pattern: /💥\s*\[\[([^\]]+)\]\]/i, emoji: '💥' },
+                { type: 'healing', pattern: /💚\s*\[\[([^\]]+)\]\]/i, emoji: '💚' }
+            ];
+
+            for (const pattern of directPatterns) {
+                const match = macroText.match(pattern.pattern);
+                if (match) {
+                    const result = {
+                        type: pattern.type,
+                        emoji: pattern.emoji,
+                        diceFormula: match[1],
+                        fullMatch: match[0]
+                    };
+
+                    TrapSystem.utils.log(`Found ${pattern.type} pattern: ${result.diceFormula}`, 'debug');
+                    results.push(result);
+                }
+            }
+
+            // Pattern 2: Multiple damage types with descriptions
+            const multipleDamagePattern = /💥\s*\[\[([^\]]+)\]\]\s*\*\*([^*]+)\*\*/gi;
+            const multipleMatches = [...macroText.matchAll(multipleDamagePattern)];
+            
+            if (multipleMatches.length > 0) {
+                const damageTypes = [];
+                for (const match of multipleMatches) {
+                    damageTypes.push({
+                        diceFormula: match[1],
+                        damageType: match[2].trim(),
+                        fullMatch: match[0]
+                    });
+                }
+
+                const result = {
+                    type: 'multiple_damage',
+                    emoji: '💥',
+                    damageTypes: damageTypes,
+                    fullMatch: multipleMatches.map(m => m[0]).join(' ')
+                };
+
+                TrapSystem.utils.log(`Found multiple damage types: ${damageTypes.length} types`, 'debug');
+                results.push(result);
+            }
+
+            // Pattern 3: Save requirements (using existing SKILL_TYPES configuration)
+            const savePatterns = [
+                /🛡️\s*(\w+)\s*saving\s*throw\s*\(DC\s*(\d+)\)/i,
+                /🛡️\s*(\w+)\s*DC\s*(\d+)/i
+            ];
+
+            for (const pattern of savePatterns) {
+                const match = macroText.match(pattern);
+                if (match) {
+                    const saveType = match[1];
+                    const dc = parseInt(match[2]);
+                    
+                    // Check if this save type exists in our SKILL_TYPES configuration
+                    const validSaveTypes = Object.keys(TrapSystem.config.SKILL_TYPES).filter(key => 
+                        key.toLowerCase().includes('saving throw') && 
+                        key.toLowerCase().includes(saveType.toLowerCase())
+                    );
+                    
+                    if (validSaveTypes.length === 0) {
+                        TrapSystem.utils.log(`Warning: Save type '${saveType}' not found in SKILL_TYPES configuration`, 'warn');
+                    }
+                    
+                    const result = {
+                        type: 'save_requirement',
+                        emoji: '🛡️',
+                        saveType: saveType,
+                        dc: dc,
+                        fullMatch: match[0],
+                        validSaveType: validSaveTypes[0] || null
+                    };
+
+                    TrapSystem.utils.log(`Found save requirement: ${result.saveType} DC ${result.dc}`, 'debug');
+                    results.push(result);
+                }
+            }
+
+            // Pattern 4: Save result levels (for complex save systems)
+            const saveResultPattern = /🛡️\s*DC\s*(\d+)(?:\s*or\s*lower|\s*-\s*(\d+)|(?:\s*\+))?\s*\(([^)]+)\)/gi;
+            const saveResultMatches = [...macroText.matchAll(saveResultPattern)];
+            
+            if (saveResultMatches.length > 0) {
+                // Damage multiplier mapping for save results
+                const damageMultipliers = {
+                    "Half damage": 0.5,
+                    "Full damage": 1.0,
+                    "No damage": 0.0,
+                    "Quarter damage": 0.25,
+                    "Double damage": 2.0,
+                    "Three-quarters damage": 0.75,
+                    "Half": 0.5,
+                    "Full": 1.0,
+                    "None": 0.0,
+                    "Quarter": 0.25,
+                    "Double": 2.0,
+                    "Three-quarters": 0.75
+                };
+                
+                const saveLevels = [];
+                for (const match of saveResultMatches) {
+                    const minDC = parseInt(match[1]);
+                    let maxDC;
+                    let description;
+
+                    if (match[0].includes('or lower')) {
+                        maxDC = minDC;
+                        description = match[3] || match[0].trim();
+                    } else if (match[2]) {
+                        maxDC = parseInt(match[2]);
+                        description = match[3] || match[0].trim();
+                    } else if (match[0].includes('+')) {
+                        maxDC = 30; // High number for "or higher"
+                        description = match[3] || match[0].trim();
+                    } else {
+                        maxDC = 30;
+                        description = match[3] || match[0].trim();
+                    }
+
+                    // Calculate damage multiplier from description
+                    const damageMultiplier = damageMultipliers[description] || null;
+                    
+                    saveLevels.push({
+                        minDC: minDC,
+                        maxDC: maxDC,
+                        description: description,
+                        damageMultiplier: damageMultiplier
+                    });
+                }
+
+                const result = {
+                    type: 'save_result_levels',
+                    emoji: '🛡️',
+                    saveLevels: saveLevels,
+                    fullMatch: saveResultMatches.map(m => m[0]).join(' ')
+                };
+
+                TrapSystem.utils.log(`Found save result levels: ${saveLevels.length} levels`, 'debug');
+                results.push(result);
+            }
+
+            // Return all found patterns (or null if none found)
+            if (results.length > 0) {
+                TrapSystem.utils.log(`Found ${results.length} damage/healing patterns in macro`, 'debug');
+                return results.length === 1 ? results[0] : results; // Return single result or array
+            }
+
+            TrapSystem.utils.log('No damage/healing patterns found in macro', 'debug');
+            return null;
+        },
+
+        // Process and execute damage/healing patterns from parsed macro content
+        async processDamageOrHealing(parsedResults, targetCharacterId, playerId = null, actualRollResults = null) {
+            if (!parsedResults || !targetCharacterId) {
+                TrapSystem.utils.log('processDamageOrHealing called with invalid parameters', 'warn');
+                return false;
+            }
+
+            const char = getObj('character', targetCharacterId);
+            if (!char) {
+                TrapSystem.utils.log(`Character not found for ID: ${targetCharacterId}`, 'error');
+                return false;
+            }
+
+            const charName = char.get('name');
+            TrapSystem.utils.log(`Processing damage/healing for ${charName} (ID: ${targetCharacterId})`, 'debug');
+
+            let totalDamage = 0;
+            let totalHealing = 0;
+            let saveRequirements = [];
+
+            // Process each parsed result
+            for (const result of Array.isArray(parsedResults) ? parsedResults : [parsedResults]) {
+                TrapSystem.utils.log(`Processing result type: ${result.type}`, 'debug');
+
+                switch (result.type) {
+                    case 'damage':
+                        let damageAmount;
+                        if (actualRollResults && actualRollResults.length > 0) {
+                            damageAmount = actualRollResults.shift(); // Take the first roll result
+                            TrapSystem.utils.log(` -> Using actual roll result: ${damageAmount} damage (${result.diceFormula})`, 'debug');
+                        } else {
+                            damageAmount = this.parseAndRollLuckDie(result.diceFormula);
+                            TrapSystem.utils.log(` -> Rolled dice: ${damageAmount} damage (${result.diceFormula})`, 'debug');
+                            TrapSystem.utils.chat(`🎲 **Fallback:** Rolled ${damageAmount} damage (${result.diceFormula}) - could not extract from macro`);
+                        }
+                        totalDamage += damageAmount;
+                        TrapSystem.utils.log(` -> Added ${damageAmount} damage (${result.diceFormula})`, 'debug');
+                        break;
+
+                    case 'healing':
+                        let healingAmount;
+                        if (actualRollResults && actualRollResults.length > 0) {
+                            healingAmount = actualRollResults.shift(); // Take the first roll result
+                            TrapSystem.utils.log(` -> Using actual roll result: ${healingAmount} healing (${result.diceFormula})`, 'debug');
+                        } else {
+                            healingAmount = this.parseAndRollLuckDie(result.diceFormula);
+                            TrapSystem.utils.log(` -> Rolled dice: ${healingAmount} healing (${result.diceFormula})`, 'debug');
+                            TrapSystem.utils.chat(`🎲 **Fallback:** Rolled ${healingAmount} healing (${result.diceFormula}) - could not extract from macro`);
+                        }
+                        totalHealing += healingAmount;
+                        TrapSystem.utils.log(` -> Added ${healingAmount} healing (${result.diceFormula})`, 'debug');
+                        break;
+
+                    case 'multiple_damage':
+                        for (let i = 0; i < result.damageTypes.length; i++) {
+                            const damageType = result.damageTypes[i];
+                            let damageAmount;
+                            if (actualRollResults && actualRollResults.length > 0) {
+                                damageAmount = actualRollResults.shift(); // Take the next roll result
+                                TrapSystem.utils.log(` -> Using actual roll result: ${damageAmount} ${damageType.damageType} damage (${damageType.diceFormula})`, 'debug');
+                            } else {
+                                damageAmount = this.parseAndRollLuckDie(damageType.diceFormula);
+                                TrapSystem.utils.log(` -> Rolled dice: ${damageAmount} ${damageType.damageType} damage (${damageType.diceFormula})`, 'debug');
+                                TrapSystem.utils.chat(`🎲 **Fallback:** Rolled ${damageAmount} ${damageType.damageType} damage (${damageType.diceFormula}) - could not extract from macro`);
+                            }
+                            totalDamage += damageAmount;
+                            TrapSystem.utils.log(` -> Added ${damageAmount} ${damageType.damageType} damage (${damageType.diceFormula})`, 'debug');
+                        }
+                        break;
+
+                    case 'save_requirement':
+                        saveRequirements.push({
+                            saveType: result.saveType,
+                            dc: result.dc,
+                            validSaveType: result.validSaveType
+                        });
+                        TrapSystem.utils.log(` -> Added save requirement: ${result.saveType} DC ${result.dc}`, 'debug');
+                        break;
+
+                    case 'save_result_levels':
+                        // Handle complex save systems with damage multipliers
+                        saveRequirements.push({
+                            saveType: 'Complex',
+                            dc: result.saveLevels[0]?.minDC || 10,
+                            saveLevels: result.saveLevels
+                        });
+                        TrapSystem.utils.log(` -> Added complex save system with ${result.saveLevels.length} levels`, 'debug');
+                        break;
+
+                    default:
+                        TrapSystem.utils.log(` -> Unknown result type: ${result.type}`, 'warn');
+                        break;
+                }
+            }
+
+            // Apply healing first (if any)
+            if (totalHealing > 0) {
+                const healResult = await this.applyHealing(targetCharacterId, totalHealing);
+                if (healResult) {
+                    TrapSystem.utils.chat(`💚 Applied ${totalHealing} healing to ${charName}`);
+                }
+            }
+
+            // Handle save requirements and damage
+            if (saveRequirements.length > 0) {
+                TrapSystem.utils.log(`Save requirements detected: ${saveRequirements.length}`, 'debug');
+                
+                // If we have damage and saves, set up the save system
+                if (totalDamage > 0) {
+                    // Use the first save requirement (ignore duplicates)
+                    const saveReq = saveRequirements[0];
+                    const saveResultLevels = parsedResults.find(r => r.type === 'save_result_levels')?.saveLevels || null;
+                    
+                    TrapSystem.utils.log(`Setting up save with: ${saveReq.saveType} DC ${saveReq.dc}, ${totalDamage} damage`, 'debug');
+                    
+                    // Set up the save system
+                    const saveId = await TrapSystem.utils.setupDamageHealingSave(
+                        targetCharacterId, 
+                        totalDamage, 
+                        saveReq.saveType, 
+                        saveReq.dc, 
+                        saveResultLevels
+                    );
+                    
+                    TrapSystem.utils.log(`setupDamageHealingSave returned: ${saveId}`, 'debug');
+                    
+                    if (saveId) {
+                        TrapSystem.utils.log(`Save setup successful for ${charName}`, 'debug');
+                        // Don't send separate save prompt - it will be integrated into the main template
+                        // The save prompt will appear in the main template message when it's executed
+                        return true; // Save is pending, don't apply damage yet
+                    } else {
+                        TrapSystem.utils.log(`setupDamageHealingSave returned false/null, not sending save prompt`, 'debug');
+                    }
+                }
+            } else if (totalDamage > 0) {
+                // Direct damage (no save required)
+                const damageResult = await this.applyDamage(targetCharacterId, totalDamage);
+                if (damageResult) {
+                    TrapSystem.utils.chat(`💥 Applied ${totalDamage} damage to ${charName}`);
+                }
+            }
+
+            return true;
+        },
+
+        // Main entry point for processing damage/healing macros
+        async handleDamageHealingMacro(macroText, targetCharacterId = null, playerId = null, executedTemplateContent = null) {
+            if (!macroText || typeof macroText !== 'string') {
+                TrapSystem.utils.log('handleDamageHealingMacro called with invalid macro text', 'warn');
+                return false;
+            }
+
+            TrapSystem.utils.log(`Processing damage/healing macro: ${macroText.substring(0, 100)}...`, 'debug');
+
+            // Parse the macro for patterns
+            const parsedResults = this.parseDamageOrHealing(macroText);
+            if (!parsedResults) {
+                TrapSystem.utils.log('No damage/healing patterns found in macro', 'debug');
+                return false;
+            }
+
+            // Resolve target character if not provided
+            let finalTargetId = targetCharacterId;
+            if (!finalTargetId) {
+                // Try to get from selected token
+                const selectedTokens = findObjs({ _type: 'graphic', _subtype: 'token', selected: true });
+                if (selectedTokens.length > 0) {
+                    finalTargetId = selectedTokens[0].get('represents');
+                    TrapSystem.utils.log(`Using selected token's character ID: ${finalTargetId}`, 'debug');
+                } else {
+                    TrapSystem.utils.chat('❌ No target character specified and no token selected');
+                    return false;
+                }
+            }
+
+            // Validate target character
+            const targetChar = getObj('character', finalTargetId);
+            if (!targetChar) {
+                TrapSystem.utils.chat(`❌ Target character not found: ${finalTargetId}`);
+                return false;
+            }
+
+            const targetName = targetChar.get('name');
+            TrapSystem.utils.log(`Target character: ${targetName} (ID: ${finalTargetId})`, 'debug');
+
+            // Extract actual roll results from executed template if available
+            let actualRollResults = null;
+            if (executedTemplateContent) {
+                const expectedRollCount = Array.isArray(parsedResults) ? parsedResults.length : 1;
+                actualRollResults = this.extractRollResultsFromTemplate(executedTemplateContent, expectedRollCount);
+                if (actualRollResults && actualRollResults.length > 0) {
+                    TrapSystem.utils.log(`Extracted ${actualRollResults.length} actual roll results: [${actualRollResults.join(', ')}]`, 'debug');
+                } else {
+                    TrapSystem.utils.log(`No actual roll results extracted from template`, 'debug');
+                }
+            }
+
+            // Process the damage/healing patterns
+            const result = await this.processDamageOrHealing(parsedResults, finalTargetId, playerId, actualRollResults);
+            
+            if (result) {
+                TrapSystem.utils.log(`Successfully processed damage/healing macro for ${targetName}`, 'debug');
+                return true;
+            } else {
+                TrapSystem.utils.log(`Failed to process damage/healing macro for ${targetName}`, 'error');
+                return false;
+            }
+        },
+
+        // Extract roll results from template message using libInline
+        extractRollResultsFromTemplate(templateContent, expectedRollCount, msg = null) {
+            try {
+                TrapSystem.utils.log(`Extracting roll results from template content`, 'debug');
+                
+                // First, try to use libInline if available and we have a message with inlinerolls
+                if (typeof libInline !== 'undefined' && msg && msg.inlinerolls && msg.inlinerolls.length >= expectedRollCount) {
+                    TrapSystem.utils.log(`Using libInline to extract roll results`, 'debug');
+                    TrapSystem.utils.log(`Inline rolls structure: ${JSON.stringify(msg.inlinerolls.map(r => ({ expression: r.expression, results: r.results })))}`, 'debug');
+                    
+                    const results = [];
+                    for (let i = 0; i < expectedRollCount; i++) {
+                        try {
+                            const rollValue = libInline.getValue(msg.inlinerolls[i]);
+                            TrapSystem.utils.log(`libInline.getValue(${i}) returned: ${rollValue}`, 'debug');
+                            
+                            if (rollValue && rollValue > 0) {
+                                results.push(rollValue);
+                                TrapSystem.utils.log(`Extracted roll result ${i + 1}: ${rollValue}`, 'debug');
+                            } else {
+                                // Try direct access to the roll result
+                                const directValue = msg.inlinerolls[i].results.total;
+                                TrapSystem.utils.log(`Direct access to roll ${i} total: ${directValue}`, 'debug');
+                                
+                                if (directValue && directValue > 0) {
+                                    results.push(directValue);
+                                    TrapSystem.utils.log(`Extracted roll result ${i + 1} via direct access: ${directValue}`, 'debug');
+                                } else {
+                                    TrapSystem.utils.log(`Roll ${i + 1} returned invalid value: ${rollValue} (direct: ${directValue})`, 'debug');
+                                }
+                            }
+                        } catch (error) {
+                            TrapSystem.utils.log(`Error extracting roll ${i + 1}: ${error.message}`, 'debug');
+                        }
+                    }
+                    
+                    if (results.length === expectedRollCount) {
+                        return results;
+                    } else {
+                        TrapSystem.utils.log(`libInline extraction failed: got ${results.length} valid results, expected ${expectedRollCount}`, 'debug');
+                    }
+                }
+                
+                // Fallback: Try to find the actual roll results in the executed template
+                // Look for patterns like "3 Force", "6 Fire", "1 Necrotic" where the numbers are the roll results
+                const damagePattern = /(\d+)\s+(Force|Fire|Necrotic|Acid|Cold|Lightning|Thunder|Psychic|Radiant|Bludgeoning|Piercing|Slashing)/gi;
+                const matches = [...templateContent.matchAll(damagePattern)];
+                
+                if (matches && matches.length >= expectedRollCount) {
+                    const results = [];
+                    for (let i = 0; i < expectedRollCount; i++) {
+                        const rollResult = parseInt(matches[i][1]);
+                        results.push(rollResult);
+                        TrapSystem.utils.log(`Extracted roll result ${i + 1}: ${rollResult} (${matches[i][2]})`, 'debug');
+                    }
+                    return results;
+                }
+                
+                // Second, try to find roll results in HTML format (with <br/> tags)
+                // Look for patterns like "6 Force", "1 Fire", "5 Necrotic" in HTML content
+                const htmlDamagePattern = /(\d+)\s+(Force|Fire|Necrotic|Acid|Cold|Lightning|Thunder|Psychic|Radiant|Bludgeoning|Piercing|Slashing)/gi;
+                const htmlMatches = [...templateContent.matchAll(htmlDamagePattern)];
+                
+                if (htmlMatches && htmlMatches.length >= expectedRollCount) {
+                    const results = [];
+                    for (let i = 0; i < expectedRollCount; i++) {
+                        const rollResult = parseInt(htmlMatches[i][1]);
+                        results.push(rollResult);
+                        TrapSystem.utils.log(`Extracted roll result ${i + 1}: ${rollResult} (${htmlMatches[i][2]}) from HTML`, 'debug');
+                    }
+                    return results;
+                }
+                
+                // Third, try to find the roll results by looking for the damage type names and extracting numbers before them
+                const forceMatch = templateContent.match(/(\d+)\s*Force/i);
+                const fireMatch = templateContent.match(/(\d+)\s*Fire/i);
+                const necroticMatch = templateContent.match(/(\d+)\s*Necrotic/i);
+                
+                if (forceMatch && fireMatch && necroticMatch) {
+                    const results = [
+                        parseInt(forceMatch[1]),
+                        parseInt(fireMatch[1]),
+                        parseInt(necroticMatch[1])
+                    ];
+                    TrapSystem.utils.log(`Extracted roll results: Force(${results[0]}), Fire(${results[1]}), Necrotic(${results[2]})`, 'debug');
+                    return results;
+                }
+                
+                // Fallback: Look for roll results in the template content
+                // Pattern: [[1d6]] becomes the actual roll result
+                const rollMatches = templateContent.match(/\[\[(\d+)d\d+\]\]/g);
+                
+                if (rollMatches && rollMatches.length >= expectedRollCount) {
+                    const results = [];
+                    for (let i = 0; i < expectedRollCount; i++) {
+                        // Extract the actual roll result from the template
+                        const rollResult = parseInt(rollMatches[i].match(/(\d+)/)[1]);
+                        results.push(rollResult);
+                        TrapSystem.utils.log(`Extracted roll result ${i + 1}: ${rollResult}`, 'debug');
+                    }
+                    return results;
+                }
+                
+                TrapSystem.utils.log(`No roll results found in template content`, 'debug');
+                TrapSystem.utils.log(`Template content preview: ${templateContent.substring(0, 200)}...`, 'debug');
+                return null;
+            } catch (error) {
+                TrapSystem.utils.log(`Error extracting roll results: ${error.message}`, 'debug');
+                return null;
+            }
+        },
+
+        // Damage/Healing Save Management Functions
+        async setupDamageHealingSave(characterId, damageAmount, saveType, dc, saveResultLevels = null) {
+            const char = getObj('character', characterId);
+            if (!char) {
+                TrapSystem.utils.log(`Character not found for save setup: ${characterId}`, 'error');
+                return false;
+            }
+
+            const charName = char.get('name');
+            const saveId = `${characterId}_${Date.now()}`;
+            
+            // Store save info
+            TrapSystem.state.pendingSaves.set(saveId, {
+                characterId: characterId,
+                characterName: charName,
+                damage: damageAmount,
+                saveType: saveType,
+                dc: dc,
+                timestamp: Date.now(),
+                saveResultLevels: saveResultLevels
+            });
+
+            TrapSystem.utils.log(`Setup damage/healing save for ${charName}: ${saveType} DC ${dc}, ${damageAmount} damage`, 'debug');
+
+            // Set timeout to auto-apply damage if no save is made
+            setTimeout(() => {
+                const pending = TrapSystem.state.pendingSaves.get(saveId);
+                if (pending) {
+                    // Use the latest stored damage (updated after roll extraction), fallback to original amount
+                    const finalDamage = (typeof pending.damage === 'number' && pending.damage > 0)
+                        ? pending.damage
+                        : damageAmount;
+                    TrapSystem.utils.log(`Timeout: ${charName} failed to make save, applying full damage ${finalDamage}`, 'debug');
+
+                    // GM-only default template timeout message with token image
+                    const tokenForChar = findObjs({_type: 'graphic', represents: characterId})[0];
+                    const tokenUrl = tokenForChar ? TrapSystem.utils.getTokenImageURL(tokenForChar, 'thumb') : '';
+                    const tokenImg = tokenUrl && tokenUrl !== '👤' ? `<img src='${tokenUrl}' width='30' height='30'>` : '👤';
+                    const timeoutTemplate = `&{template:default} {{name=⏰ Save Timeout}} {{Character=${charName}}} {{Damage=💥 ${finalDamage}}} {{Token=${tokenImg}}}`;
+                    TrapSystem.utils.chat(timeoutTemplate);
+
+                    TrapSystem.utils.applyDamage(characterId, finalDamage);
+                    TrapSystem.state.pendingSaves.delete(saveId);
+                }
+            }, TrapSystem.config.DAMAGE_HEALING.saveTimeout);
+
+            return saveId;
+        },
+
+        processDamageHealingSaveRoll(rollData, playerId) {
+            TrapSystem.utils.log(`Processing damage/healing save roll for player ${playerId}`, 'debug');
+            TrapSystem.utils.log(`Pending saves count: ${TrapSystem.state.pendingSaves.size}`, 'debug');
+
+            // Find matching pending save - check all pending saves for this player
+            for (const [saveId, saveData] of TrapSystem.state.pendingSaves) {
+                TrapSystem.utils.log(`Checking pending save for characterId: ${saveData.characterId}`, 'debug');
+                const character = getObj('character', saveData.characterId);
+                if (character) {
+                    const controlledBy = (character.get("controlledby") || "").split(",");
+                    const isControlledByPlayer = controlledBy.includes(playerId) || controlledBy.includes("all");
+                    
+                    TrapSystem.utils.log(`  Character controlled by: ${controlledBy.join(', ')}`, 'debug');
+                    TrapSystem.utils.log(`  Player ID making roll: ${playerId}`, 'debug');
+                    TrapSystem.utils.log(`  Is controlled by player: ${isControlledByPlayer}`, 'debug');
+
+                    if (isControlledByPlayer) {
+                        const rollResult = rollData.total;
+                        TrapSystem.utils.log(`  Extracted roll result: ${rollResult}`, 'debug');
+                        
+                        if (rollResult !== null) {
+                            TrapSystem.utils.log(`Processing save roll for ${saveData.characterName}: ${rollResult}`, 'debug');
+                            
+                            // Check if we have custom save result levels from the macro
+                            if (saveData.saveResultLevels && saveData.saveResultLevels.length > 0) {
+                                TrapSystem.utils.log(`Using custom save result levels: ${saveData.saveResultLevels.length} levels`, 'debug');
+                                
+                                // Find the matching save result level
+                                let matchedLevel = null;
+                                for (const level of saveData.saveResultLevels) {
+                                    TrapSystem.utils.log(`Checking level: ${level.description} (${level.minDC}-${level.maxDC})`, 'debug');
+                                    if (rollResult <= level.maxDC) {
+                                        matchedLevel = level;
+                                        TrapSystem.utils.log(`Matched level: ${level.description}`, 'debug');
+                                        break;
+                                    }
+                                }
+                                
+                                if (matchedLevel) {
+                                    // Calculate damage based on save level
+                                    let appliedDamage;
+                                    let isSuccess;
+                                    
+                                    if (matchedLevel.description.includes('Success')) {
+                                        appliedDamage = Math.floor(saveData.damage / 2);
+                                        isSuccess = true;
+                                    } else {
+                                        appliedDamage = saveData.damage;
+                                        isSuccess = false;
+                                    }
+
+                                    // Build default template (send to GM and roller)
+                                    const tokenForCharA = findObjs({_type: 'graphic', represents: saveData.characterId})[0];
+                                    const tokenUrlA = tokenForCharA ? TrapSystem.utils.getTokenImageURL(tokenForCharA, 'thumb') : '';
+                                    const tokenImgA = tokenUrlA && tokenUrlA !== '👤' ? `<img src='${tokenUrlA}' width='30' height='30'>` : '👤';
+                                    const saveResultTemplate = `&{template:default} {{name=🛡️ Save Result}} {{Character=${saveData.characterName}}} {{Roll=${rollResult}}} {{DC=${matchedLevel.minDC}}} {{Outcome=${matchedLevel.description}}} {{Damage=💥 ${appliedDamage}}} {{Token=${tokenImgA}}}`;
+                                    // Send to GM and, if roller isn't a GM, to the roller as well
+                                    TrapSystem.utils.chat(saveResultTemplate); // GM
+                                    if (!TrapSystem.utils.playerIsGM(playerId)) {
+                                        TrapSystem.utils.whisper(playerId, saveResultTemplate); // Roller
+                                    }
+                                    
+                                    if (appliedDamage > 0) {
+                                        TrapSystem.utils.applyDamage(saveData.characterId, appliedDamage);
+                                    }
+                                } else {
+                                    // Fallback: no matching level found
+                                    TrapSystem.utils.log(`No matching level found for roll ${rollResult}`, 'debug');
+                                    const tokenForCharB = findObjs({_type: 'graphic', represents: saveData.characterId})[0];
+                                    const tokenUrlB = tokenForCharB ? TrapSystem.utils.getTokenImageURL(tokenForCharB, 'thumb') : '';
+                                    const tokenImgB = tokenUrlB && tokenUrlB !== '👤' ? `<img src='${tokenUrlB}' width='30' height='30'>` : '👤';
+                                    const fallbackTemplate = `&{template:default} {{name=❓ Save Result}} {{Character=${saveData.characterName}}} {{Roll=${rollResult}}} {{DC=${saveData.dc}}} {{Outcome=No matching save level}} {{Damage=💥 ${saveData.damage}}} {{Token=${tokenImgB}}}`;
+                                    TrapSystem.utils.chat(fallbackTemplate); // GM
+                                    if (!TrapSystem.utils.playerIsGM(playerId)) {
+                                        TrapSystem.utils.whisper(playerId, fallbackTemplate); // Roller
+                                    }
+                                    TrapSystem.utils.applyDamage(saveData.characterId, saveData.damage);
+                                }
+                            } else {
+                                // Use simple success/fail logic
+                                const success = rollResult >= saveData.dc;
+                                const damage = success ? Math.floor(saveData.damage / 2) : saveData.damage;
+                                
+                                const tokenForCharC = findObjs({_type: 'graphic', represents: saveData.characterId})[0];
+                                const tokenUrlC = tokenForCharC ? TrapSystem.utils.getTokenImageURL(tokenForCharC, 'thumb') : '';
+                                const tokenImgC = tokenUrlC && tokenUrlC !== '👤' ? `<img src='${tokenUrlC}' width='30' height='30'>` : '👤';
+                                const outcome = success ? 'Success' : 'Failed';
+                                const saveResultTemplate = `&{template:default} {{name=🛡️ Save Result}} {{Character=${saveData.characterName}}} {{Roll=${rollResult}}} {{DC=${saveData.dc}}} {{Outcome=${outcome}}} {{Damage=💥 ${damage}}} {{Token=${tokenImgC}}}`;
+                                TrapSystem.utils.chat(saveResultTemplate); // GM
+                                if (!TrapSystem.utils.playerIsGM(playerId)) {
+                                    TrapSystem.utils.whisper(playerId, saveResultTemplate); // Roller
+                                }
+
+                                // Apply damage
+                                TrapSystem.utils.applyDamage(saveData.characterId, damage);
+                            }
+                            
+                            // Remove from pending saves
+                            TrapSystem.state.pendingSaves.delete(saveId);
+                            return true;
+                        } else {
+                            TrapSystem.utils.log(`  No roll result extracted from message`, 'debug');
+                        }
+                    } else {
+                        TrapSystem.utils.log(`  Player ${playerId} does not control character ${saveData.characterId}`, 'debug');
+                    }
+                } else {
+                    TrapSystem.utils.log(`  Character ${saveData.characterId} not found`, 'debug');
+                }
+            }
+
+            TrapSystem.utils.log(`No matching pending damage/healing save found for player ${playerId}`, 'debug');
+            return false;
         },
 
         hasLineOfSight(observerToken, targetToken) {
@@ -2388,7 +3330,10 @@ const TrapSystem = {
                         setTimeout(() => {
                             movedToken.set({ left:pos.final.x, top:pos.final.y });
                         }, 500);
-                        TrapSystem.triggers.handleTrapTrigger(movedToken, trapToken, i); // Pass intersection point 'i'
+                        // Call the async function without await since we're in a setTimeout callback
+                        TrapSystem.triggers.handleTrapTrigger(movedToken, trapToken, i).catch(err => {
+                            TrapSystem.utils.log(`Error in handleTrapTrigger: ${err.message}`, 'error');
+                        });
                         return; // Important: Return after handling a trigger to prevent multiple triggers from one move
                     }
                 }
@@ -2405,7 +3350,10 @@ const TrapSystem = {
                     setTimeout(() => {
                         movedToken.set({ left:pos.final.x, top:pos.final.y });
                     }, 500);
-                    TrapSystem.triggers.handleTrapTrigger(movedToken, trapToken, centerOfMovedToken); // Pass centerOfMovedToken as intersection point
+                    // Call the async function without await since we're in a setTimeout callback
+                    TrapSystem.triggers.handleTrapTrigger(movedToken, trapToken, centerOfMovedToken).catch(err => {
+                        TrapSystem.utils.log(`Error in handleTrapTrigger: ${err.message}`, 'error');
+                    });
                     return; // Important: Return after handling a trigger
                 }
             }
@@ -2470,7 +3418,7 @@ const TrapSystem = {
         },
 
         // The core function for when a trap triggers
-        handleTrapTrigger(triggeredToken, trapToken, originalIntersectionPoint = null) {
+        async handleTrapTrigger(triggeredToken, trapToken, originalIntersectionPoint = null) {
             const data = TrapSystem.utils.parseTrapNotes(trapToken.get("gmnotes"), trapToken);
             if(!data || !data.isArmed || data.currentUses <= 0) {
                 TrapSystem.utils.chat('❌ Trap cannot be triggered (disarmed or out of uses)');
@@ -2587,7 +3535,7 @@ const TrapSystem = {
                     TrapSystem.utils.log(`Simple auto-triggered interaction trap '${trapToken.get('name')}'. Resolving immediately.`, 'info');
                     
                     // 1. Execute primary macro by calling markTriggered
-                    TrapSystem.triggers.markTriggered(triggeredToken.id, trapToken.id, 'primary');
+                    await TrapSystem.triggers.markTriggered(triggeredToken.id, trapToken.id, 'primary');
                     
                     // 2. Immediately unlock the token (allowMovement handles use depletion)
                     TrapSystem.triggers.allowMovement(triggeredToken.id, true); // Suppress individual message
@@ -2601,7 +3549,7 @@ const TrapSystem = {
 
                 if (data.primaryMacro && data.primaryMacro.macro) {
                     // Use the new centralized helper function
-                    const success = TrapSystem.triggers.markTriggered(triggeredToken.id, trapToken.id, 'primary');
+                    const success = await TrapSystem.triggers.markTriggered(triggeredToken.id, trapToken.id, 'primary');
                     if (success) {
                         TrapSystem.triggers.getTrapStatus(trapToken);
                         wasAutoTriggeredAndHasMacro = true;
@@ -2704,7 +3652,7 @@ const TrapSystem = {
         },
 
         // Allow movement
-        allowMovement(tokenId, suppressMessage = false) {
+        allowMovement(tokenId, suppressMessage = false, cancelPendingSave = true) {
             TrapSystem.utils.log(`allowMovement called with tokenId: ${tokenId}`, 'debug');
             const lockData = TrapSystem.state.lockedTokens[tokenId];
             if(!lockData) return;
@@ -2722,6 +3670,24 @@ const TrapSystem = {
                     }
                 }
             }
+            // Optionally cancel pending save (used for GM allow; auto/player release won't cancel)
+            if (cancelPendingSave) {
+                try {
+                    const characterId = token ? token.get('represents') : null;
+                    if (characterId) {
+                        for (const [saveId, saveData] of TrapSystem.state.pendingSaves) {
+                            if (saveData.characterId === characterId) {
+                                TrapSystem.state.pendingSaves.delete(saveId);
+                                TrapSystem.utils.log(`Cancelled pending save for ${saveData.characterName} due to early unlock.`, 'debug');
+                                break;
+                            }
+                        }
+                    }
+                } catch (e) {
+                    TrapSystem.utils.log(`Error cancelling pending save on unlock: ${e.message}`, 'warning');
+                }
+            }
+
             delete TrapSystem.state.lockedTokens[tokenId];
             TrapSystem.state.safeMoveTokens.add(tokenId);
             
@@ -2836,7 +3802,8 @@ const TrapSystem = {
             }
 
             // Use the proper allowMovement function to handle safety systems
-            TrapSystem.triggers.allowMovement(tokenId, true); // Suppress the default message
+                // Auto/player release should NOT cancel pending save – pass cancelPendingSave=false
+                TrapSystem.triggers.allowMovement(tokenId, true, false); // Suppress message, keep pending save
 
             // Send custom release message
             const tokenName = trappedToken.get('name') || 'Unknown Token';
@@ -2897,7 +3864,7 @@ const TrapSystem = {
             return true;
         },
 
-        markTriggered(tokenId, trapId, macroIdentifier) {
+        async markTriggered(tokenId, trapId, macroIdentifier) {
             // [UPDATED: Now also executes the macro immediately]
             if(TrapSystem.state.lockedTokens[tokenId]) {
                 TrapSystem.state.lockedTokens[tokenId].macroTriggered = true;
@@ -2917,7 +3884,7 @@ const TrapSystem = {
                         }
                     }
                     if (macroToExecute) {
-                        const macroExists = TrapSystem.utils.executeMacro(macroToExecute, tagToIdMap);
+                        const macroExists = await TrapSystem.utils.executeMacro(macroToExecute, tagToIdMap);
                         if (!macroExists) {
                             TrapSystem.utils.chat(`⚠️ Warning: Macro '${macroToExecute}' not found or failed to execute.`);
                         }
@@ -4170,6 +5137,21 @@ const TrapSystem = {
         handleRollResult(roll, playerid_of_roller) { // Renamed playerid to playerid_of_roller for clarity
             try {
                 TrapSystem.utils.log(`Processing roll result from player:${playerid_of_roller} (who rolled) => total:${roll.total}, roll.characterid:${roll.characterid}`, 'debug');
+                
+                // NEW: Check for damage/healing save rolls first
+                TrapSystem.utils.log(`Checking for damage/healing saves. Pending saves count: ${TrapSystem.state.pendingSaves.size}`, 'debug');
+                if (TrapSystem.state.pendingSaves.size > 0) {
+                    TrapSystem.utils.log(`Calling processDamageHealingSaveRoll for player ${playerid_of_roller}`, 'debug');
+                    const damageHealingSaveProcessed = TrapSystem.utils.processDamageHealingSaveRoll(roll, playerid_of_roller);
+                    if (damageHealingSaveProcessed) {
+                        TrapSystem.utils.log(`Damage/healing save roll processed successfully`, 'debug');
+                        return; // Exit early if damage/healing save was handled
+                    } else {
+                        TrapSystem.utils.log(`Damage/healing save roll was not processed`, 'debug');
+                    }
+                } else {
+                    TrapSystem.utils.log(`No pending saves found`, 'debug');
+                }
                 
                 let pendingCheck = null;
 
@@ -6346,7 +7328,7 @@ on("change:graphic", async (obj, prev) => {
 // ---------------------------------------------------
 // 9) CHAT COMMANDS
 // ---------------------------------------------------
-on("chat:message",(msg) => {
+on("chat:message", async (msg) => {
     // Rolls from character sheets
     if(msg.type==="advancedroll") {
         try {
@@ -6385,8 +7367,20 @@ on("chat:message",(msg) => {
                     }
                 }
 
-                if (!pending) {
-                    TrapSystem.utils.log(`No pending check found for player:${msg.playerid} or character:${msg.characterId} from advancedroll`, 'debug');
+                // NEW: Check for pending damage/healing saves
+                let hasPendingSave = false;
+                if (TrapSystem.state.pendingSaves.size > 0) {
+                    for (const [saveId, saveData] of TrapSystem.state.pendingSaves) {
+                        if (saveData.characterId === msg.characterId) {
+                            hasPendingSave = true;
+                            TrapSystem.utils.log(`Found pending damage/healing save for character ID: ${msg.characterId}`, 'debug');
+                            break;
+                        }
+                    }
+                }
+
+                if (!pending && !hasPendingSave) {
+                    TrapSystem.utils.log(`No pending check or save found for player:${msg.playerid} or character:${msg.characterId} from advancedroll`, 'debug');
                     return;
                 }
 
@@ -6425,6 +7419,47 @@ on("chat:message",(msg) => {
             }
         } catch(e) {
             TrapSystem.utils.log(`Error in advancedroll parse: ${e.message}`, 'error'); // Added .message
+        }
+        return;
+    }
+    
+    // NEW: Capture executed template messages for damage/healing roll extraction
+    if (msg.type === 'general' && msg.content && 
+        msg.content.includes('{{desc=') && 
+        msg.content.includes('Explosion Damage Types') && 
+        msg.inlinerolls && msg.inlinerolls.length >= 3) {
+        
+        TrapSystem.utils.log(`Captured template message with inline rolls: ${msg.content.substring(0, 100)}...`, 'debug');
+        TrapSystem.utils.log(`Found ${msg.inlinerolls.length} inline rolls`, 'debug');
+        
+        // Extract roll results from the captured template message
+        const rollResults = TrapSystem.utils.extractRollResultsFromTemplate(msg.content, 3, msg);
+        if (rollResults && rollResults.every(r => r > 0)) {
+            TrapSystem.utils.log(`Extracted roll results from chat: ${rollResults.join(', ')}`, 'debug');
+            
+            // Update the pending save with the correct damage amount
+            for (const [saveId, saveData] of TrapSystem.state.pendingSaves) {
+                const totalDamage = rollResults.reduce((sum, roll) => sum + roll, 0);
+                saveData.damage = totalDamage;
+                
+                // Show a GM-only summary message with token image
+                const char = getObj('character', saveData.characterId);
+                const charName = char ? char.get('name') : 'Unknown';
+                
+                // Get the trapped token for the image (render as <img> for default template)
+                const trappedToken = findObjs({_type: 'graphic', represents: saveData.characterId})[0];
+                const tokenUrl = trappedToken ? TrapSystem.utils.getTokenImageURL(trappedToken, 'med') : '';
+                const tokenImg = tokenUrl && tokenUrl !== '👤' ? `<img src='${tokenUrl}' width='30' height='30'>` : '👤';
+                
+                const summaryTemplate = `&{template:default} {{name=🎯 Damage Summary}} {{Token=${tokenImg}}} {{Details=**${rollResults[0]} Force** + **${rollResults[1]} Fire** + **${rollResults[2]} Necrotic** = **${totalDamage} total**}} {{Save=🛡️ ${charName}: Dexterity save (DC 14)}} {{Timer=⏰ 60s to roll or auto-fail}}`;
+
+                // Send to GM only using GM chat helper (whispers to all GMs)
+                TrapSystem.utils.chat(summaryTemplate);
+                TrapSystem.utils.log(`GM-only damage summary sent (with token image: ${tokenUrl ? 'yes' : 'no'})`, 'debug');
+                break; // Update the first pending save
+            }
+        } else {
+            TrapSystem.utils.log(`Failed to extract valid roll results: ${rollResults}`, 'debug');
         }
         return;
     }
@@ -6510,7 +7545,7 @@ on("chat:message",(msg) => {
 
         // Whitelist 'interact' as it gets the trap token ID from arguments.
         // Sub-actions within 'interact' will handle specific token needs (e.g., a triggering character for a skill check).
-        if (!selectedToken && !["enable", "disable", "toggle", "status", "help", "allowall", "exportmacros", "resetstates", "resetmacros", "fullreset", "allowmovement", "resetdetection", "interact", "hidedetection", "showdetection", "bulkenabletokenbar", "bulkdisabletokenbar", "togglefaileddetection", "showfailedhistory", "showsettings", "playerinteract", "playerinteraction", "playerexplain", "playerdone"].includes(action.toLowerCase())) {
+        if (!selectedToken && !["enable", "disable", "toggle", "status", "help", "allowall", "exportmacros", "resetstates", "resetmacros", "fullreset", "allowmovement", "resetdetection", "interact", "hidedetection", "showdetection", "bulkenabletokenbar", "bulkdisabletokenbar", "togglefaileddetection", "showfailedhistory", "showsettings", "playerinteract", "playerinteraction", "playerexplain", "playerdone", "damage", "heal", "debug"].includes(action.toLowerCase())) {
             TrapSystem.utils.chat('❌ Error: No token selected for this action!');
             TrapSystem.utils.log(`[API Handler] Action '${action}' requires a selected token, but none was found.`, 'warn');
                 return;
@@ -6656,8 +7691,10 @@ on("chat:message",(msg) => {
                         TrapSystem.utils.chat("❌ Error: No token selected!");
                         return;
                     }
+                    // GM manual allow movement: cancelPendingSave=true (default)
                     TrapSystem.triggers.allowMovement(msg.selected[0]._id);
                 } else if (movementTokenId) {
+                    // GM manual allow movement: cancelPendingSave=true (default)
                     TrapSystem.triggers.allowMovement(movementTokenId);
                 } else {
                     TrapSystem.utils.chat("❌ Error: No token specified!");
@@ -6863,6 +7900,22 @@ on("chat:message",(msg) => {
                 break;
             case "help": {
                 TrapSystem.utils.showHelpMenu("TrapSystem");
+                } 
+                break;
+            case "debug":
+                if (args.length < 3) {
+                    TrapSystem.utils.chat('❌ Usage: !trapsystem debug <on|off>');
+                    return;
+                }
+                const debugSetting = args[2].toLowerCase();
+                if (debugSetting === 'on') {
+                    TrapSystem.config.DEBUG = true;
+                    TrapSystem.utils.chat('✅ Debug mode enabled');
+                } else if (debugSetting === 'off') {
+                    TrapSystem.config.DEBUG = false;
+                    TrapSystem.utils.chat('❌ Debug mode disabled');
+                } else {
+                    TrapSystem.utils.chat('❌ Invalid debug setting. Use "on" or "off"');
                 } 
                 break;
             case "fail":
@@ -7287,6 +8340,114 @@ on("chat:message",(msg) => {
                 TrapSystem.commands.handlePlayerDone(trapToken, playerId, triggeredTokenId);
                 break;
             }
+            case "damage":
+                if (args.length < 2) {
+                    TrapSystem.utils.chat('❌ Usage: !trapsystem damage [target] <amount>\nExamples: !trapsystem damage 5, !trapsystem damage trapped 2d6+3');
+                    return;
+                }
+                
+                let damageAmount, damageCharId;
+                if (args.length === 3) {
+                    // No target specified, use selected token
+                    TrapSystem.utils.log(`DEBUG: args.length = ${args.length}, msg.selected = ${msg.selected ? msg.selected.length : 'null'}`, 'debug');
+                    if (!msg.selected || msg.selected.length === 0) {
+                        TrapSystem.utils.chat('❌ No token selected and no target specified');
+                        return;
+                    }
+                    TrapSystem.utils.log(`DEBUG: Selected token ID: ${msg.selected[0]._id}`, 'debug');
+                    const selectedToken = getObj("graphic", msg.selected[0]._id);
+                    if (!selectedToken) {
+                        TrapSystem.utils.chat('❌ Could not find selected token');
+                        return;
+                    }
+                    damageCharId = selectedToken.get("represents");
+                    TrapSystem.utils.log(`DEBUG: Token represents character ID: ${damageCharId}`, 'debug');
+                    if (!damageCharId) {
+                        TrapSystem.utils.chat('❌ Selected token does not represent a character');
+                        return;
+                    }
+                    damageAmount = args[2];
+                    TrapSystem.utils.log(`DEBUG: Damage amount from args[2]: ${damageAmount}`, 'debug');
+                } else {
+                    // Target specified
+                    const damageTarget = args[2];
+                    damageAmount = args.slice(3).join(' ');
+                    
+                    // Handle "trapped" keyword
+                    if (damageTarget === "trapped") {
+                        const trappedTokens = Object.keys(TrapSystem.state.lockedTokens);
+                        if (trappedTokens.length === 0) {
+                            TrapSystem.utils.chat('❌ No trapped characters found');
+                            return;
+                        }
+                        const trappedToken = getObj("graphic", trappedTokens[trappedTokens.length - 1]);
+                        damageCharId = trappedToken ? trappedToken.get("represents") : null;
+                    } else {
+                        // Assume direct character ID
+                        damageCharId = damageTarget;
+                    }
+                }
+                
+                if (!damageCharId) {
+                    TrapSystem.utils.chat('❌ Could not resolve target for damage');
+                    return;
+                }
+                
+                TrapSystem.utils.log(`DEBUG: Calling applyDamage with characterId: ${damageCharId}, damageAmount: ${damageAmount}`, 'debug');
+                TrapSystem.utils.applyDamage(damageCharId, damageAmount);
+                break;
+            case "heal":
+                if (args.length < 2) {
+                    TrapSystem.utils.chat('❌ Usage: !trapsystem heal [target] <amount>\nExamples: !trapsystem heal 5, !trapsystem heal trapped 1d8+2');
+                    return;
+                }
+                
+                let healAmount, healCharId;
+                if (args.length === 3) {
+                    // No target specified, use selected token
+                    if (!msg.selected || msg.selected.length === 0) {
+                        TrapSystem.utils.chat('❌ No token selected and no target specified');
+                        return;
+                    }
+                    const selectedToken = getObj("graphic", msg.selected[0]._id);
+                    if (!selectedToken) {
+                        TrapSystem.utils.chat('❌ Could not find selected token');
+                        return;
+                    }
+                    healCharId = selectedToken.get("represents");
+                    if (!healCharId) {
+                        TrapSystem.utils.chat('❌ Selected token does not represent a character');
+                        return;
+                    }
+                    healAmount = args[2];
+                } else {
+                    // Target specified
+                    const healTarget = args[2];
+                    healAmount = args.slice(3).join(' ');
+                    
+                    // Handle "trapped" keyword
+                    if (healTarget === "trapped") {
+                        const trappedTokens = Object.keys(TrapSystem.state.lockedTokens);
+                        if (trappedTokens.length === 0) {
+                            TrapSystem.utils.chat('❌ No trapped characters found');
+                            return;
+                        }
+                        const trappedToken = getObj("graphic", trappedTokens[trappedTokens.length - 1]);
+                        healCharId = trappedToken ? trappedToken.get("represents") : null;
+                    } else {
+                        // Assume direct character ID
+                        healCharId = healTarget;
+                    }
+                }
+                
+                if (!healCharId) {
+                    TrapSystem.utils.chat('❌ Could not resolve target for healing');
+                    return;
+                }
+                
+                TrapSystem.utils.log(`DEBUG: Calling applyHealing with characterId: ${healCharId}, healAmount: ${healAmount}`, 'debug');
+                TrapSystem.utils.applyHealing(healCharId, healAmount);
+                break;
             default:
                 TrapSystem.utils.chat(`❌ Unknown command: ${action}\nUse !trapsystem help for command list`);
         }
